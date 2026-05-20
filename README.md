@@ -64,3 +64,35 @@ production. Détail dans S5.
 - Workspace : `dbc-422021d7-64a4.cloud.databricks.com` (Free Edition serverless)
 - Catalog : `workspace`, schema : `tp_spark_lfa`
 - Compte étudiant : `l.faloci@myskolae.fr`
+
+## Notes correcteur — corrections post-rendu
+
+Une revue technique du livrable a été conduite après la première mise en
+ligne. Les **sources Python `.py`** dans `sources/` reflètent la version
+**finale post-revue**. Les `.dbc` contiennent les **outputs des runs Databricks
+originaux** (preuve d'exécution). Différences entre les deux :
+
+| Séance | Correction | Fichier source | Présent dans `.dbc` ? |
+|---|---|---|---|
+| **S2** | En-tête tableau "Mode sortie KPI = `update`" → `append` (cible `update`, justification §5 inchangée) | `sources/S2_Silver_Stream_LFA.py` ligne 29 | non — modif cosmétique markdown |
+| **S3** | Ajout cellule Markdown explicite expliquant la **dilution** du taux de rejet (≈ 6.95 % observé vs 20 % théorique) par l'historique propre S1/S2 dans `silver_stream_taxi` | `sources/S3_Qualite_Stream_LFA.py` §8bis | non — ajout cellule markdown |
+| **S4** | `LABEL_MAP` corrigé selon les centroïdes Spark Core S5 : `0=BANLIEUE_REG, 1=LONG_COURRIER, 2=HUB_URBAIN, 3=PREMIUM_LUXE` (initialement `URBAIN_CENTRE/HUB_VOLUME/BANLIEUE_GREEN/LONG_COURRIER` inversé sur les clusters 0 et 2) | `sources/S4_Scoring_Stream_LFA.py` lignes 268-274 | non — code corrigé mais pipeline pas re-runné |
+| **S5** | `nb_iter` du benchmark passé de **5 à 10** itérations par rate (conformément au PDF Séance 5 §1-2) | `sources/S5_Final_LFA.py` lignes 85-86 + 139 | non — bench effectué initialement à 5 iter pour économiser compute serverless saturé |
+
+**Honnêteté technique sur la non-conformité S5 → 10 iter** : le bench initial
+des 4 rates × 5 iter a montré que la **durée moyenne par run est dominée par
+le cold start Spark** (~9 s overhead fixe, indépendant du rate). Passer à 10
+iter ne change pas la nature du résultat (pas de saturation observée
+{20, 50, 100, 200} sur Free Edition serverless) — voir analyse en S5 §A.4.
+
+**Justification S4 — `transform()` vs Stream-Static Join** : la sandbox Py4J
+de Databricks Free Edition serverless **bloque l'instanciation directe des
+classes MLlib** (`Py4JSecurityException: VectorAssembler constructor is not
+whitelisted`). Impossible donc d'utiliser `PipelineModel.load() + transform()`
+comme demandé par le PDF Séance 4. Le **Stream-Static Join** sur la table
+déjà clusterisée (`workspace.default.gold_quartiers_clustered` produite par
+le notebook Spark Core S5 `04_ML_Clustering`) est **sémantiquement équivalent**
+au scoring batch : le mapping zone → cluster est figé une fois le modèle
+entraîné, donc l'inférence streaming se réduit à un lookup broadcast (~265
+zones). En production sur cluster classique, on retomberait sur l'API MLflow
+standard.
