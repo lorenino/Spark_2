@@ -47,11 +47,12 @@ garanti par Delta `_delta_log` + checkpoint Spark.
 - **Test de résilience S3 (éliminatoire) validé** : count Gold avant = après = 1 098, Δ=0.
 - **Modèle K-Means Spark Core S5 réutilisé** via Stream-Static Join sur
   `workspace.default.gold_quartiers_clustered` (262 zones, 4 clusters).
-- **4 contraintes Databricks Free Edition serverless rencontrées et documentées** :
+- **5 contraintes Databricks Free Edition serverless rencontrées et documentées** :
   1. `processingTime` non supporté → boucle Python avec `availableNow=True`
   2. `update` Delta refusé sur `.toTable()` → bascule `append` documentée
   3. `GLOBAL TEMPORARY VIEW` interdit serverless
   4. `pyspark.ml` bloqué Py4J → bascule Stream-Static Join sur table déjà clusterisée
+  5. `CLEAR CACHE` (`spark.catalog.clearCache()`) bloqué serverless → wrap try/except dans S5 Partie B (la mesure cache/no-cache reste valide via le premier run baseline)
 
 ## Honnêteté technique
 

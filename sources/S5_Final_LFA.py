@@ -263,11 +263,22 @@ def measure_silver_run():
     return time.time() - start
 
 # Run AVANT cache
-print("--- AVANT cache de ref_taxi_zones ---")
+# Note : spark.catalog.clearCache() est BLOQUÉ sur Free Edition serverless
+# ([NOT_SUPPORTED_WITH_SERVERLESS] CLEAR CACHE — 5ème contrainte serverless
+# rencontrée dans le module, après processingTime, update Delta, GLOBAL TEMP
+# VIEW, et pyspark.ml). On ne peut donc pas garantir l'absence de cache
+# entre les runs « avant ». Le résultat reste interprétable car :
+# 1. Au premier run, le cache n'a pas encore été matérialisé.
+# 2. Les runs suivants AVANT n'utilisent pas .cache() explicite.
+# 3. La comparaison reste valide entre "sans .cache() explicite" et "avec .cache()".
+print("--- AVANT cache de ref_taxi_zones (ClearCache skip — contrainte serverless) ---")
 durations_before = []
 for i in range(3):
-    # On force la décache au cas où
-    spark.catalog.clearCache()
+    try:
+        spark.catalog.clearCache()
+    except Exception as e:
+        if i == 0:
+            print(f"  ℹ️  clearCache non supporté : {type(e).__name__} → on continue sans")
     d = measure_silver_run()
     durations_before.append(d)
     print(f"  run {i+1}: {d:.2f}s")
@@ -540,6 +551,8 @@ except Exception as e:
 # MAGIC
 # MAGIC 3. **`GLOBAL TEMPORARY VIEW` interdit serverless** → workaround `foreachBatch + MERGE` non viable (combiné avec la contrainte précédente). En prod sur cluster classique, le pattern canonique est `foreachBatch + MERGE INTO` Delta avec target table préprée.
 # MAGIC
+# MAGIC 3bis. **`CLEAR CACHE` interdit serverless (5ème contrainte rencontrée)** → en Partie B Optim 1, l'idée de comparer la Batch Duration avec/sans cache de `ref_taxi_zones` exige de pouvoir purger le cache entre les conditions. `spark.catalog.clearCache()` lève `[NOT_SUPPORTED_WITH_SERVERLESS] CLEAR CACHE is not supported on serverless compute (SQLSTATE: 0A000)`. Workaround : on garde l'expérience telle quelle (try/except sur clearCache) en assumant que le premier run "AVANT" sert de baseline non-cachée par construction. La mesure reste interprétable comme **différence entre `.cache()` explicite et absence de cache explicite**, ce qui est l'information pédagogique principale.
+# MAGIC
 # MAGIC 4. **`pyspark.ml` bloqué côté Py4J serverless** → impossible d'instancier `VectorAssembler`, `StandardScaler`, `KMeans`, `Pipeline` en local sur Free Edition. En S4 j'ai dû abandonner `PipelineModel.load() + transform()` au profit d'un Stream-Static Join sur la table déjà clusterisée par Spark Core S5. **C'est conceptuellement équivalent** (le modèle est figé, le mapping zone→cluster est immuable post-entraînement) mais ce n'est **pas l'API MLflow** qu'on utiliserait en prod. Sur cluster classique, un Job Databricks dédié au scoring chargerait le `PipelineModel` une fois et appliquerait `transform()` au stream.
 # MAGIC
 # MAGIC 5. **Watermark sans effet pratique** → en S2, le ratio `silver/bronze` est resté à 100 % alors qu'on attendait 91-92 % théorique. Cause identifiée : `_random_datetime` du simulateur tire des Event Times sur 24 h, donc le `max event-time` se balade tellement que la zone hors watermark fluctue sans jamais se stabiliser. **Solution propre** : générer des Event Times monotones (incrémentaux) côté simulateur — mais c'est hors scope cours.
@@ -585,7 +598,10 @@ for q in spark.streams.active:
     print(f"Stopping query: {q.name} (id={q.id})")
     q.stop()
 
-# Décache aussi pour libérer la mémoire
-spark.catalog.clearCache()
+# Décache aussi pour libérer la mémoire (skip si serverless bloque)
+try:
+    spark.catalog.clearCache()
+except Exception:
+    pass  # NOT_SUPPORTED_WITH_SERVERLESS, voir Partie B Optim 1
 
 print("✓ Toutes les streams arrêtées et caches libérés.")
