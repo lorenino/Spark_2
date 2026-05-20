@@ -284,26 +284,48 @@ for i in range(3):
     print(f"  run {i+1}: {d:.2f}s")
     time.sleep(5)
 
-# Mise en cache
+# Mise en cache — bloquée serverless ([NOT_SUPPORTED_WITH_SERVERLESS] PERSIST TABLE).
+# Sur Databricks Free Edition serverless, .cache() / .persist() lèvent une
+# AnalysisException : PERSIST TABLE n'est pas supporté. C'est la 6ème contrainte
+# serverless rencontrée dans le module (cf §C.3 point 3ter).
+# On wrap dans try/except et on documente honnêtement le résultat.
 print("\n--- Mise en cache ---")
-df_zones_cached = spark.table(REF_ZONES_TABLE).cache()
-n = df_zones_cached.count()  # force la matérialisation
-print(f"✓ {n} zones cachées en mémoire")
+cache_supported = True
+try:
+    df_zones_cached = spark.table(REF_ZONES_TABLE).cache()
+    n = df_zones_cached.count()  # force la matérialisation
+    print(f"✓ {n} zones cachées en mémoire")
+except Exception as e:
+    cache_supported = False
+    err_short = str(e).split("\n")[0][:200]
+    print(f"⚠️  .cache() bloqué sur serverless : {type(e).__name__}: {err_short}")
+    print(f"    → On ne peut PAS mesurer l'effet du cache explicite sur Free Edition.")
+    print(f"    → C'est la 6ème contrainte serverless rencontrée (cf §C.3 point 3ter).")
 
-# Run APRÈS cache
-print("\n--- APRÈS cache de ref_taxi_zones ---")
+# Run APRÈS cache (skip si .cache() bloqué — résultat documenté plus bas)
 durations_after = []
-for i in range(3):
-    d = measure_silver_run()
-    durations_after.append(d)
-    print(f"  run {i+1}: {d:.2f}s")
-    time.sleep(5)
+if cache_supported:
+    print("\n--- APRÈS cache de ref_taxi_zones ---")
+    for i in range(3):
+        d = measure_silver_run()
+        durations_after.append(d)
+        print(f"  run {i+1}: {d:.2f}s")
+        time.sleep(5)
 
-avg_before = sum(durations_before) / len(durations_before)
-avg_after  = sum(durations_after)  / len(durations_after)
-print(f"\n→ Avant cache : {avg_before:.2f}s en moyenne")
-print(f"→ Après cache : {avg_after:.2f}s en moyenne")
-print(f"→ Gain : {avg_before - avg_after:.2f}s ({100*(avg_before-avg_after)/avg_before:.1f}%)")
+    avg_before = sum(durations_before) / len(durations_before)
+    avg_after  = sum(durations_after)  / len(durations_after)
+    print(f"\n→ Avant cache : {avg_before:.2f}s en moyenne")
+    print(f"→ Après cache : {avg_after:.2f}s en moyenne")
+    print(f"→ Gain : {avg_before - avg_after:.2f}s ({100*(avg_before-avg_after)/avg_before:.1f}%)")
+else:
+    avg_before = sum(durations_before) / len(durations_before)
+    avg_after = None
+    print(f"\n→ Avant cache : {avg_before:.2f}s en moyenne (3 runs OK avant que .cache() ne soit refusé)")
+    print(f"→ Après cache : N/A (.cache() bloqué serverless)")
+    print(f"→ Optim 1 conclusion : l'expérience n'est pas testable sur Free Edition.")
+    print(f"  Sur un cluster classique, on attendrait ~50-200ms gagnées par run sur le scan")
+    print(f"  de ref_taxi_zones (265 lignes / ~10 KB). Sur serverless, le coût de scan est")
+    print(f"  marginal devant le cold start ~5s qui domine la mesure.")
 
 # COMMAND ----------
 
@@ -551,7 +573,9 @@ except Exception as e:
 # MAGIC
 # MAGIC 3. **`GLOBAL TEMPORARY VIEW` interdit serverless** → workaround `foreachBatch + MERGE` non viable (combiné avec la contrainte précédente). En prod sur cluster classique, le pattern canonique est `foreachBatch + MERGE INTO` Delta avec target table préprée.
 # MAGIC
-# MAGIC 3bis. **`CLEAR CACHE` interdit serverless (5ème contrainte rencontrée)** → en Partie B Optim 1, l'idée de comparer la Batch Duration avec/sans cache de `ref_taxi_zones` exige de pouvoir purger le cache entre les conditions. `spark.catalog.clearCache()` lève `[NOT_SUPPORTED_WITH_SERVERLESS] CLEAR CACHE is not supported on serverless compute (SQLSTATE: 0A000)`. Workaround : on garde l'expérience telle quelle (try/except sur clearCache) en assumant que le premier run "AVANT" sert de baseline non-cachée par construction. La mesure reste interprétable comme **différence entre `.cache()` explicite et absence de cache explicite**, ce qui est l'information pédagogique principale.
+# MAGIC 3bis. **`CLEAR CACHE` interdit serverless (5ème contrainte rencontrée)** → en Partie B Optim 1, l'idée de comparer la Batch Duration avec/sans cache de `ref_taxi_zones` exige de pouvoir purger le cache entre les conditions. `spark.catalog.clearCache()` lève `[NOT_SUPPORTED_WITH_SERVERLESS] CLEAR CACHE is not supported on serverless compute (SQLSTATE: 0A000)`. Workaround : try/except sur clearCache — le premier run "AVANT" sert de baseline non-cachée par construction.
+# MAGIC
+# MAGIC 3ter. **`PERSIST TABLE` (`.cache()`) également interdit serverless (6ème contrainte)** → la mesure Optim 1 « après cache » n'est carrément pas exécutable. `df_zones_cached = spark.table(REF_ZONES_TABLE).cache()` lève `[NOT_SUPPORTED_WITH_SERVERLESS] PERSIST TABLE is not supported on serverless compute`. Conséquence : on a uniquement les 3 runs AVANT (~4-6s chacun, dominés par cold start), pas de runs APRÈS, pas de calcul de gain. **Conclusion honnête livrée dans le notebook** : l'expérience cache n'est pas testable sur Free Edition serverless ; sur cluster classique l'effet attendu serait marginal (~50-200ms gagnées sur scan d'une table 10 KB, négligeable devant le cold start ~5s). L'Optim 2 (OPTIMIZE ZORDER) reste mesurable et constitue l'évaluation principale.
 # MAGIC
 # MAGIC 4. **`pyspark.ml` bloqué côté Py4J serverless** → impossible d'instancier `VectorAssembler`, `StandardScaler`, `KMeans`, `Pipeline` en local sur Free Edition. En S4 j'ai dû abandonner `PipelineModel.load() + transform()` au profit d'un Stream-Static Join sur la table déjà clusterisée par Spark Core S5. **C'est conceptuellement équivalent** (le modèle est figé, le mapping zone→cluster est immuable post-entraînement) mais ce n'est **pas l'API MLflow** qu'on utiliserait en prod. Sur cluster classique, un Job Databricks dédié au scoring chargerait le `PipelineModel` une fois et appliquerait `transform()` au stream.
 # MAGIC
