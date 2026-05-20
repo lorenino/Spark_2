@@ -45,7 +45,11 @@ SCHEMA_LOCATION = f"{VOL_SCHEMAS}/bronze_stream/"
 
 # Tables
 BRONZE_STREAM_TABLE = f"{CATALOG}.{SCHEMA}.bronze_stream_taxi"
-BRONZE_BATCH_TABLE  = f"{CATALOG}.{SCHEMA}.bronze_taxi_trips"  # référence Spark Core (peut être absente)
+# Référence batch héritée de Spark Core (notebook 01_Bronze, mars 2026).
+# Le PDF Séance 1 la mentionne sous le nom `bronze_taxi_trips`. Chez moi
+# elle s'appelle `bronze_yellow_taxi` et vit dans le schéma `default`
+# (Spark Core a tourné avant la création de `tp_spark_lfa`).
+BRONZE_BATCH_TABLE  = "workspace.default.bronze_yellow_taxi"
 
 print(f"SIM_OUTPUT_PATH = {SIM_OUTPUT_PATH}")
 print(f"CHECKPOINT_PATH = {CHECKPOINT_PATH}")
@@ -279,63 +283,53 @@ spark.table(BRONZE_STREAM_TABLE).show(5, truncate=False)
 # MAGIC %md
 # MAGIC ## 7. Validation cohérence schéma vs Spark Core
 # MAGIC
-# MAGIC Référence : `bronze_taxi_trips` de Spark Core S5 si présente. Sinon
-# MAGIC (workspace from scratch), on compare au **schéma NYC Taxi canonique**
-# MAGIC documenté par le simulateur (PDF cours).
+# MAGIC Référence : `workspace.default.bronze_yellow_taxi` — la table Bronze
+# MAGIC batch produite par mon Spark Core (notebook `01_Bronze`, 4 mars 2026,
+# MAGIC 19 colonnes NYC Yellow Taxi 2025 sur les parquets officiels). Le PDF
+# MAGIC Séance 1 la cite sous le nom canonique `bronze_taxi_trips` ; chez moi
+# MAGIC elle s'appelle `bronze_yellow_taxi` et vit dans `workspace.default`
+# MAGIC parce que Spark Core a tourné avant la création de `tp_spark_lfa`.
 # MAGIC
-# MAGIC Différences attendues côté stream (acceptables) :
-# MAGIC - `ingestion_timestamp` — ajouté par le pipeline (technique)
-# MAGIC - `source_file` — ajouté par le pipeline (technique)
-# MAGIC - `sim_batch_id` — injecté par le simulateur
-# MAGIC - `sim_is_corrupted` — injecté par le simulateur (oracle quarantaine S3)
+# MAGIC Différences attendues **côté stream** :
+# MAGIC - `ingestion_timestamp` — colonne technique du pipeline Bronze
+# MAGIC - `sim_batch_id` — injectée par le simulateur
+# MAGIC - `sim_is_corrupted` — oracle quarantaine S3 (jamais utilisé comme feature)
+# MAGIC - `_rescued_data` — ajoutée d'office par Auto Loader (champs hors schéma)
+# MAGIC
+# MAGIC Différences attendues **côté batch** (colonnes NYC Yellow Taxi officielles
+# MAGIC que le simulateur ne génère pas) :
+# MAGIC - `RatecodeID`, `store_and_fwd_flag`, `extra`, `mta_tax`,
+# MAGIC   `tolls_amount`, `improvement_surcharge`, `congestion_surcharge`,
+# MAGIC   `Airport_fee`
 
 # COMMAND ----------
-
-# Schéma NYC Taxi canonique (du PDF Simulateur)
-NYC_TAXI_CANONICAL = {
-    "VendorID":              "int",
-    "tpep_pickup_datetime":  "timestamp",
-    "tpep_dropoff_datetime": "timestamp",
-    "passenger_count":       "double",
-    "trip_distance":         "double",
-    "PULocationID":          "int",
-    "DOLocationID":          "int",
-    "payment_type":          "int",
-    "fare_amount":           "double",
-    "tip_amount":            "double",
-    "total_amount":          "double",
-}
 
 def schema_signature(table_name):
     return {f.name: f.dataType.simpleString() for f in spark.table(table_name).schema.fields}
 
 sig_stream = schema_signature(BRONZE_STREAM_TABLE)
-
-# Tentative de récupérer le schéma batch (Spark Core S5)
-try:
-    sig_batch = schema_signature(BRONZE_BATCH_TABLE)
-    reference_name = "bronze_taxi_trips (Spark Core S5)"
-except Exception:
-    print(f"⚠️  Table batch {BRONZE_BATCH_TABLE} absente — fallback sur le "
-          f"schéma NYC Taxi canonique documenté.")
-    sig_batch = NYC_TAXI_CANONICAL
-    reference_name = "NYC Taxi canonique (doc simulateur)"
+sig_batch  = schema_signature(BRONZE_BATCH_TABLE)
+reference_name = f"{BRONZE_BATCH_TABLE} (Spark Core, notebook 01_Bronze)"
 
 common      = set(sig_stream) & set(sig_batch)
 only_stream = set(sig_stream) - set(sig_batch)
 only_batch  = set(sig_batch)  - set(sig_stream)
 
 print(f"\n=== Comparaison vs {reference_name} ===\n")
+print(f"  bronze_stream_taxi   : {len(sig_stream)} colonnes")
+print(f"  bronze_yellow_taxi   : {len(sig_batch)} colonnes")
+print(f"  Communes             : {len(common)}\n")
+
 print(f"Colonnes communes ({len(common)}) :")
 for c in sorted(common):
     same = "✓" if sig_stream[c] == sig_batch[c] else "✗"
-    print(f"  {same} {c:25s}  stream={sig_stream[c]:15s} | ref={sig_batch[c]}")
+    print(f"  {same} {c:25s}  stream={sig_stream[c]:15s} | batch={sig_batch[c]}")
 
 print(f"\nUniquement dans bronze_stream_taxi ({len(only_stream)}) :")
 for c in sorted(only_stream):
     print(f"  + {c}: {sig_stream[c]}")
 
-print(f"\nUniquement dans la référence ({len(only_batch)}) :")
+print(f"\nUniquement dans la référence batch ({len(only_batch)}) :")
 for c in sorted(only_batch):
     print(f"  - {c}: {sig_batch[c]}")
 
@@ -344,18 +338,28 @@ for c in sorted(only_batch):
 # MAGIC %md
 # MAGIC ### Commentaire
 # MAGIC
-# MAGIC Les divergences côté stream sont **attendues** :
-# MAGIC - `ingestion_timestamp` + `source_file` : colonnes techniques ajoutées
-# MAGIC   explicitement par le pipeline Bronze pour la traçabilité.
-# MAGIC - `sim_batch_id` + `sim_is_corrupted` : ajoutées par le simulateur.
-# MAGIC   `sim_is_corrupted` est un **oracle** (à n'utiliser qu'a posteriori en S3
-# MAGIC   pour mesurer le recall de la quarantaine, jamais comme feature).
+# MAGIC **Côté stream uniquement** (ajouts attendus) :
+# MAGIC - `ingestion_timestamp` : colonne technique du pipeline Bronze (traçabilité).
+# MAGIC - `sim_batch_id` + `sim_is_corrupted` : injectées par le simulateur.
+# MAGIC   `sim_is_corrupted` est un **oracle** à n'utiliser qu'a posteriori en
+# MAGIC   S3 (mesure du recall de la quarantaine), jamais comme feature.
+# MAGIC - `_rescued_data` : ajoutée d'office par Auto Loader pour les champs
+# MAGIC   hors schéma — comportement nominal, signal de robustesse du pipeline.
 # MAGIC
-# MAGIC Sur la comparaison ci-dessus, le mismatch éventuel sur les types
-# MAGIC `int vs integer` est une équivalence cosmétique (`int = integer = int32`
-# MAGIC dans Spark) — pas une vraie divergence. Si une **colonne canonique
-# MAGIC manque** côté stream, c'est que le simulateur ne la génère pas ; à
-# MAGIC corriger côté simulateur.
+# MAGIC **Côté batch uniquement** (colonnes NYC Yellow Taxi officielles non
+# MAGIC simulées) :
+# MAGIC - `RatecodeID`, `store_and_fwd_flag`, `extra`, `mta_tax`,
+# MAGIC   `tolls_amount`, `improvement_surcharge`, `congestion_surcharge`,
+# MAGIC   `Airport_fee`.
+# MAGIC
+# MAGIC Le simulateur est volontairement simplifié pour le cours (~11 colonnes
+# MAGIC métier vs 19 dans les parquets NYC officiels). Le **noyau commun** —
+# MAGIC identifiants, timestamps, géolocalisation, montants — suffit aux
+# MAGIC traitements Silver/Gold/Quarantaine sans introduire de drift de schéma.
+# MAGIC
+# MAGIC Sur les colonnes communes, le mismatch éventuel `int` vs `integer` est
+# MAGIC une équivalence cosmétique (`int = integer = int32` dans Spark), pas
+# MAGIC une vraie divergence.
 
 # COMMAND ----------
 
