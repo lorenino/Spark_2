@@ -461,6 +461,8 @@ print(f"→ Gain scan : {duration_before - duration_after:.2f}s "
 # MAGIC  │ ref_borough_stats        (stats par borough pour z-score qualité)  │
 # MAGIC  │ workspace.default.gold_quartiers_clustered                         │
 # MAGIC  │   (262 zones × cluster_pca Spark Core S5)                          │
+# MAGIC  │ workspace.default.bronze_yellow_taxi                               │
+# MAGIC  │   (21 cols NYC Yellow 2025, schéma de référence validation S1)    │
 # MAGIC  └────────────────────────────────────────────────────────────────────┘
 # MAGIC ```
 # MAGIC
@@ -559,6 +561,7 @@ except Exception as e:
 # MAGIC 2. **Distribution générée par le simulateur** : `TripGenerator` tire les montants depuis `N(14.5, 9.0)` borné à 2.5 $ minimum. Spark Core a la vraie distribution NYC Taxi (avec plus de variance, queue lourde de courses aéroport).
 # MAGIC 3. **Mode** : nos données streaming incluent les modes `normal`, `chaos`, `airport_surge`. Les valeurs aberrantes du mode `chaos` ont été filtrées (`total_amount > 0` ET `< 500`) mais elles influent quand même légèrement.
 # MAGIC 4. **Cohérence** : la **hiérarchie des boroughs** (Manhattan > Queens > Brooklyn en volume) doit rester cohérente entre les deux. Si la hiérarchie diffère, c'est un bug du simulateur (poids zones mal calibrés).
+# MAGIC 5. **Composition du `total_amount`** (point révélé par la validation cross-schema S1 du 20/05) : côté batch officiel NYC Yellow Taxi 2025, `total_amount` est la **somme de 8+1 composantes** (`fare_amount + extra + mta_tax + tolls_amount + improvement_surcharge + tip_amount + congestion_surcharge + Airport_fee + cbd_congestion_fee`). Le simulateur génère un `total_amount` **monolithique** ~`N(14.5, 9.0)` sans modéliser ces composantes individuellement. **Conséquence** : si on voulait décomposer le KPI (tip rate, surcharge rate, taxe rate), le batch le ferait, le stream pas. Le KPI "montant moyen agrégé" reste cohérent ; tout KPI ventilé serait intrinsèquement plus pauvre côté stream.
 
 # COMMAND ----------
 
@@ -583,7 +586,11 @@ except Exception as e:
 # MAGIC
 # MAGIC 6. **Test de résilience S3 = restart propre, pas vrai crash mid-batch** → la boucle attend `awaitTermination()` avant de relancer, donc le checkpoint est toujours dans un état cohérent. Un vrai test de résilience nécessiterait `kill -9` sur le driver Spark au milieu d'une écriture. Le mécanisme Delta (`_delta_log` atomique + checkpoint offset) garantit le même résultat dans les deux cas, mais l'argument est plus solide quand le crash est réel. **Acceptable pour la note** (le PDF Séance 3 demande "restart sans duplication", ce qui est démontré), perfectible en réalité.
 # MAGIC
-# MAGIC 7. **Pas de bronze_taxi_trips batch côté `tp_spark_lfa`** → la validation schéma S1 (`bronze_stream_taxi` vs Spark Core S5) a dû faire fallback sur le schéma NYC Taxi canonique du PDF Simulateur. Un vrai pipeline MLOps ingère d'abord les fichiers historiques en batch puis branche le streaming sur le même schéma.
+# MAGIC 7. **Schéma simulateur intentionnellement simplifié vs batch officiel NYC** → la validation cross-schema S1 (`bronze_stream_taxi` 16 cols vs `workspace.default.bronze_yellow_taxi` 21 cols, faite le 20/05) révèle **9 colonnes officielles absentes côté stream** : `RatecodeID`, `store_and_fwd_flag`, `extra`, `mta_tax`, `tolls_amount`, `improvement_surcharge`, `congestion_surcharge`, `Airport_fee` et **`cbd_congestion_fee`** (cette dernière ajoutée par NYC TLC post-2025, non documentée dans le PDF Simulateur — découverte tardive). Conséquences en production :
+# MAGIC    - **KPI ventilés impossibles** côté stream (cf C.2 point 5) : impossible de calculer un tip rate, surcharge rate, taxe rate sans les composantes.
+# MAGIC    - **Quarantaine appauvrie** côté stream (cf S3) : 4-5 types d'anomalies en plus seraient détectables avec `store_and_fwd_flag='Y'` (transmission différée), `extra > 5$` ou `< 0$`, `mta_tax ≠ 0.5$` standard, `improvement_surcharge` non-conforme.
+# MAGIC    - **Mismatch de types** sur 4 colonnes communes (`VendorID`, `PULocationID`, `DOLocationID`, `payment_type`) : Auto Loader infère `int` côté stream, batch est `bigint`. Équivalence cosmétique sur les volumes NYC (265 zones max tiennent en `int`), mais à acknowledger.
+# MAGIC    Sur un vrai pipeline MLOps, le simulateur serait étendu pour générer les 21 colonnes officielles, garantissant la **parité de schéma** stream/batch et l'utilisation symétrique des features dans Silver/Gold/Quarantaine.
 # MAGIC
 # MAGIC 8. **`LABEL_MAP` S4 corrigé après inspection des centroïdes** → mon premier mapping inversait `URBAIN_CENTRE` (que j'avais collé sur le cluster 0 = banlieue) et `BANLIEUE_GREEN` (que j'avais collé sur le cluster 2 = 432k trajets/zone sur 2.5 mi, qui est en réalité Midtown). Mapping final dérivé des centroïdes : `0=BANLIEUE_REG, 1=LONG_COURRIER, 2=HUB_URBAIN, 3=PREMIUM_LUXE`. La leçon retenue : en MLOps production, on **dérive automatiquement les labels** à partir des centroïdes (règles sur `avg_distance`, `trips_count`, etc.) plutôt que de les figer à la main — c'est ce que je ferais sur un vrai projet.
 # MAGIC
@@ -606,6 +613,7 @@ except Exception as e:
 # MAGIC | Coût opérationnel | Job ponctuel (batch quotidien) | Process continu 24/7 |
 # MAGIC | Cas d'usage | Reporting, entraînement ML, analyses profondes | Alertes anomalie, monitoring KPI, scoring temps réel |
 # MAGIC | Garanties qualité | Facile à auditer a posteriori | Quarantaine obligatoire, test de résilience nécessaire |
+# MAGIC | **Profondeur schéma** | **21 cols NYC officielles** (toutes surcharges + `cbd_congestion_fee` post-2025) | **16 cols simulées** : 11 NYC + 4 pipeline/simulateur + `_rescued_data`. 9 cols batch officielles absentes (cf C.3 #7) |
 # MAGIC
 # MAGIC **Conclusion personnelle** : le streaming est **nécessaire** pour les cas où la latence de décision compte (détection fraude, surveillance opérationnelle, alerting SLA). Pour tout le reste — ce qui inclut l'entraînement ML, le reporting business, les KPI mensuels — le batch reste plus simple, moins cher, et tout aussi efficace.
 # MAGIC

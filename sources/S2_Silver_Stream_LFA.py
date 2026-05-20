@@ -235,6 +235,22 @@ def build_silver_stream():
 # MAGIC `groupBy(window("tpep_pickup_datetime", "10 minutes"), "pickup_borough")`
 # MAGIC puis `count(*)` + `avg("total_amount")`.
 # MAGIC
+# MAGIC ### Limite intrinsèque du KPI streaming (révélée par la validation cross-schema S1)
+# MAGIC
+# MAGIC `total_amount` côté stream est **monolithique** : généré par le simulateur
+# MAGIC depuis `N(14.5, 9.0)` sans modélisation des composantes individuelles.
+# MAGIC Côté `workspace.default.bronze_yellow_taxi` (batch NYC Yellow Taxi 2025
+# MAGIC officiel, 21 colonnes), `total_amount` est la **somme de 8+1 composantes
+# MAGIC officielles** : `fare_amount + extra + mta_tax + tolls_amount +
+# MAGIC improvement_surcharge + tip_amount + congestion_surcharge + Airport_fee
+# MAGIC + cbd_congestion_fee` (la dernière ajoutée par NYC TLC post-2025).
+# MAGIC
+# MAGIC **Conséquence pour le KPI** : tant qu'on agrège `avg(total_amount)`, le
+# MAGIC résultat est cohérent stream vs batch (même grandeur agrégée). Mais tout
+# MAGIC KPI **ventilé par composante** (tip rate, taxe rate, surcharge rate)
+# MAGIC est **impossible côté stream** sans étendre le simulateur. Ce serait
+# MAGIC le premier polish à faire pour porter ce pipeline en production réelle.
+# MAGIC
 # MAGIC ### Mode sortie : compromis pragmatique `append` (avec justification)
 # MAGIC
 # MAGIC **Idéalement** on voudrait `update` pour suivre l'évolution des KPI en

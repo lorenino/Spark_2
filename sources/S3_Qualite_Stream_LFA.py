@@ -189,6 +189,27 @@ spark.table(REF_BOROUGH_STATS).show(10, truncate=False)
 # MAGIC DISTANCE_NULLE...) en premier, l'ANOMALIE_STATISTIQUE en dernier. Un
 # MAGIC trajet à -50$ ET avec un z-score élevé sera classé MONTANT_NEGATIF (plus
 # MAGIC précis pour l'analyse de causes).
+# MAGIC
+# MAGIC ### Anomalies non détectables faute de schéma batch officiel
+# MAGIC
+# MAGIC La validation cross-schema S1 (20/05) montre que `bronze_stream_taxi`
+# MAGIC n'a que 16 colonnes vs 21 côté `workspace.default.bronze_yellow_taxi`.
+# MAGIC Les 9 colonnes batch absentes côté stream limitent intrinsèquement le
+# MAGIC périmètre de la quarantaine. Avec un simulateur étendu (qui générerait
+# MAGIC les 21 colonnes officielles), on pourrait ajouter :
+# MAGIC
+# MAGIC - `store_and_fwd_flag = 'Y'` (transmission différée taxi → réseau HS
+# MAGIC   au moment du trajet, donnée techniquement OK mais signalable).
+# MAGIC - `extra > 5$` ou `< 0$` (surcharge anormale : standard NYC = 0.5$
+# MAGIC   en pointe ou 1$ en nocturne).
+# MAGIC - `mta_tax ≠ 0.5$` (taxe MTA fixe par règlement NY State).
+# MAGIC - `improvement_surcharge ≠ 0.3$` (taxe d'amélioration fixe).
+# MAGIC - `congestion_surcharge` ou `cbd_congestion_fee` non conformes aux
+# MAGIC   règles par zone (Manhattan CBD vs reste).
+# MAGIC
+# MAGIC Pour la note S3 le périmètre est les **6 types injectables par le
+# MAGIC simulateur** (cf PDF). Le manque est intentionnel pédagogiquement,
+# MAGIC mais à mentionner si le prof pose la question des limites.
 
 # COMMAND ----------
 
@@ -630,6 +651,16 @@ print(f"  couvrent bien toutes les 6 types de corruption injectés.")
 # MAGIC - **Couverture statistique** : ne pas perdre les trajets longue distance
 # MAGIC   légitimes (course aéroport) qui sont parfois flagués `ANOMALIE_STATISTIQUE`
 # MAGIC   par excès de prudence du z-score.
+# MAGIC - **Signal `store_and_fwd_flag` du batch officiel** (cf validation S1
+# MAGIC   du 20/05 — colonne absente côté stream simulé mais présente côté
+# MAGIC   `workspace.default.bronze_yellow_taxi`) : la valeur `'Y'` indique une
+# MAGIC   transmission différée par le taxi (panne réseau temporaire), pas une
+# MAGIC   donnée corrompue. Avec ce flag, un `INVERSION_TEMPS` détecté
+# MAGIC   uniquement sur des trames `store_and_fwd_flag='Y'` serait
+# MAGIC   **réinjectable en confiance** — la transmission décalée explique
+# MAGIC   naturellement les timestamps désynchronisés au moment de l'upload.
+# MAGIC   Le simulateur ne génère pas ce flag, donc on doit décider sans ce
+# MAGIC   signal d'autorité — c'est une limitation du périmètre pédagogique.
 # MAGIC
 # MAGIC ### Ma décision pour le contexte taxi
 # MAGIC

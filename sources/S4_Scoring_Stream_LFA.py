@@ -886,6 +886,22 @@ for _, row in df_drift_pd.iterrows():
 # MAGIC    drift sur "AIRPORT_LONG" pourrait être attribué à tort au volume
 # MAGIC    aéroport alors que c'est en fait un drift sur le tip moyen
 # MAGIC    Manhattan.
+# MAGIC 4. **Training/inference skew sur le schéma** (révélé par la validation
+# MAGIC    cross-schema S1 du 20/05) : le modèle K-Means Spark Core S5 a été
+# MAGIC    entraîné sur des features agrégées à partir des **21 colonnes NYC
+# MAGIC    officielles** (notamment `avg_fare` dérivée de `fare_amount` brut, et
+# MAGIC    indirectement liée à `total_amount` qui inclut les 8+1 composantes :
+# MAGIC    `extra`, `mta_tax`, `tolls_amount`, `improvement_surcharge`,
+# MAGIC    `congestion_surcharge`, `Airport_fee`, `tip_amount`,
+# MAGIC    `cbd_congestion_fee` — cette dernière ajoutée par NYC TLC post-2025).
+# MAGIC    On score le stream avec un `total_amount` **simulé monolithique** :
+# MAGIC    la grandeur agrégée est cohérente mais sa structure interne ne l'est
+# MAGIC    pas. **Effet sur le drift mesuré** : limité en pratique tant qu'on
+# MAGIC    raisonne sur `cluster_pca` qui est lui-même fonction de
+# MAGIC    `PULocationID` (mapping zone→cluster immuable), donc indépendant de
+# MAGIC    la composition tarifaire. Mais c'est une **limite conceptuelle
+# MAGIC    MLOps** classique : training set riche, inference set pauvre, à
+# MAGIC    monitorer en production réelle.
 # MAGIC
 # MAGIC ### Conclusion
 # MAGIC
