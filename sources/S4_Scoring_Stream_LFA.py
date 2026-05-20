@@ -232,7 +232,7 @@ df_pred.filter(col("prediction").isNull()).count()
 # COMMAND ----------
 
 import numpy as np
-from pyspark.sql.functions import stddev
+from pyspark.sql.functions import col, avg, stddev
 
 # 1. Sample de 200 trajets propres depuis silver_stream_taxi
 df_sample_trajets = (
