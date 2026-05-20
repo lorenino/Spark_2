@@ -67,6 +67,28 @@ production. Détail dans S5.
 - Catalog : `workspace`, schema : `tp_spark_lfa`
 - Compte étudiant : `l.faloci@myskolae.fr`
 
+## Captures écran des outputs frais (post-revue)
+
+Le dossier `screens/` contient les captures des outputs frais après corrections
+de la revue technique (notebook S5 re-runné avec `nb_iter=10` conforme PDF,
+S4 §4bis K-Means par trajet runné) :
+
+| Fichier | Contenu |
+|---|---|
+| `S4_4bis_kmeans_par_trajet.png` | Centroïdes K-Means par trajet (200 lignes silver), 4 clusters identifiables (longue distance modeste / courses courtes / premium / courte cher) |
+| `S5_00_df_log_40rows.png` | Tableau bench `df_log` complet : 40 rows × runtime 18m 10s (= 4 rates × 10 iter conforme PDF Séance 5 §1-2) |
+| `S5_01_df_summary_10iter.png` | Synthèse par rate : durations 8.04/8.25/8.17/8.10s pour rate=20/50/100/200, `n_saturated=0` partout |
+| `S5_02_courbe_latence_throughput.png` | Courbe latence vs throughput, ligne rouge saturation 20s jamais approchée → cold start dominant |
+| `S5_03_optim1_cache_skip.png` | Optim 1 cache : 3 runs AVANT à 5.16s en moyenne, APRÈS skip propre (`.cache()` bloqué serverless = 6ème contrainte) |
+| `S5_04_optim2_zorder.png` | Optim 2 OPTIMIZE ZORDER terminé en 3.16s, compaction à 1 fichier |
+| `S5_05_kpi_sparkcore_compare.png` | Comparaison KPI Spark Core S3 vs Streaming, 11 rows : EWR Spark Core $98 (aéroport), Manhattan 15.9M vs stream 6.9k |
+| `S5_06_honnetete_C3.png` | Section §C.3 "Ce qui ne fonctionne pas" enrichie (12 points dont 3bis CLEAR CACHE et 3ter PERSIST TABLE) |
+
+Pour la soutenance, les `.dbc` du repo contiennent les **outputs des runs
+originaux** (preuve d'exécution) et le code corrigé est dans `sources/`.
+Les captures ci-dessus complètent en montrant les **outputs frais après
+corrections** sans avoir à re-runner.
+
 ## Notes correcteur — corrections post-rendu
 
 Une revue technique du livrable a été conduite après la première mise en
