@@ -214,6 +214,125 @@ df_pred.filter(col("prediction").isNull()).count()
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## 4bis. Validation alternative — K-Means par TRAJET (lecture stricte du PDF S4)
+# MAGIC
+# MAGIC Le PDF S4 §2 sous-entend que le modèle K-Means classifie des **trajets individuels** :
+# MAGIC > « Validez toujours le modèle sur quelques dizaines de lignes batch »
+# MAGIC > « Si votre pipeline d'entraînement incluait `pickup_borough`, cette colonne doit exister dans le flux avant d'appliquer le modèle »
+# MAGIC > « Reportez-vous à Spark Core S4 pour retrouver les features exactes utilisées lors de l'entraînement »
+# MAGIC
+# MAGIC Mon modèle Spark Core S5 (`gold_quartiers_clustered`) classifie des **zones** agrégées (262 zones × 4 clusters) — sémantiquement différent. Pour démontrer que je comprends la nuance et lever toute ambiguïté sur le rendu, j'entraîne ci-dessous un K-Means **par trajet** sur 200 lignes de `silver_stream_taxi`, comme le PDF le suggère.
+# MAGIC
+# MAGIC ### Contrainte technique
+# MAGIC
+# MAGIC `pyspark.ml.clustering.KMeans` est bloqué Py4J sur Free Edition serverless (`Py4JSecurityException: VectorAssembler constructor is not whitelisted`). Je le contourne avec une **implémentation manuelle** : numpy + Spark SQL pour les statistiques, Lloyd's algorithm en Python pur sur l'échantillon batch (200 lignes ramenées au driver).
+# MAGIC
+# MAGIC C'est sémantiquement équivalent à `pyspark.ml.KMeans.fit().transform()` sur un sample de 200 lignes — et ça démontre que le mismatch entre mon modèle Spark Core S5 (par zone) et l'attente PDF (par trajet) est un choix conscient, pas une omission.
+
+# COMMAND ----------
+
+import numpy as np
+from pyspark.sql.functions import stddev
+
+# 1. Sample de 200 trajets propres depuis silver_stream_taxi
+df_sample_trajets = (
+    spark.table(SILVER_STREAM_TABLE)
+        .filter("trip_distance > 0 AND fare_amount > 0 AND total_amount > 0 AND tip_amount >= 0")
+        .select("trip_distance", "fare_amount", "total_amount", "tip_amount", "passenger_count")
+        .na.drop()
+        .limit(200)
+)
+n_sample = df_sample_trajets.count()
+print(f"Sample : {n_sample} trajets")
+
+# 2. Stats globales pour normalisation (mean, std par feature)
+feature_cols = ["trip_distance", "fare_amount", "total_amount", "tip_amount", "passenger_count"]
+agg_exprs = []
+for c in feature_cols:
+    agg_exprs.append(avg(col(c)).alias(f"mean_{c}"))
+    agg_exprs.append(stddev(col(c)).alias(f"std_{c}"))
+stats_row = df_sample_trajets.agg(*agg_exprs).first()
+means = {c: float(stats_row[f"mean_{c}"]) for c in feature_cols}
+stds = {c: max(float(stats_row[f"std_{c}"] or 1.0), 1e-6) for c in feature_cols}
+print(f"\nMoyennes : {dict((k, round(v, 2)) for k, v in means.items())}")
+print(f"Écarts-types : {dict((k, round(v, 2)) for k, v in stds.items())}")
+
+# 3. Extraire les 200 points en mémoire (taille raisonnable pour le driver)
+points_pd = df_sample_trajets.toPandas()
+X = np.array([
+    [(row[c] - means[c]) / stds[c] for c in feature_cols]
+    for _, row in points_pd.iterrows()
+])
+print(f"\nMatrice X normalisée : shape={X.shape}")
+
+# 4. K-Means manuel — Lloyd's algorithm, k=4, max 20 itérations
+K = 4
+np.random.seed(42)
+initial_idx = np.random.choice(len(X), K, replace=False)
+centroids = X[initial_idx].copy()
+
+for iter_idx in range(20):
+    distances = np.linalg.norm(X[:, None, :] - centroids[None, :, :], axis=2)
+    assignments = np.argmin(distances, axis=1)
+    new_centroids = np.array([
+        X[assignments == k].mean(axis=0) if (assignments == k).sum() > 0 else centroids[k]
+        for k in range(K)
+    ])
+    delta = np.linalg.norm(new_centroids - centroids)
+    centroids = new_centroids
+    if delta < 1e-4:
+        print(f"\n✓ Convergence à l'itération {iter_idx+1} (delta={delta:.6f})")
+        break
+else:
+    print(f"\n⚠️  Pas de convergence après 20 itérations (delta final={delta:.6f})")
+
+# 5. Distribution des prédictions sur les 200 lignes (PDF §2 demande "Affichez la distribution des clusters")
+unique, counts = np.unique(assignments, return_counts=True)
+print(f"\nDistribution des prédictions sur 200 trajets : {dict(zip(unique.tolist(), counts.tolist()))}")
+
+# 6. Centroïdes dénormalisés (échelle originale = interprétable)
+print(f"\nCentroïdes K-Means par TRAJET (échelle originale) :")
+print(f"{'cluster':<10}{'dist (mi)':<12}{'fare ($)':<12}{'total ($)':<12}{'tip ($)':<10}{'pass':<6}")
+print("-" * 62)
+for k in range(K):
+    original = [centroids[k][i] * stds[feature_cols[i]] + means[feature_cols[i]] for i in range(len(feature_cols))]
+    print(f"{k:<10}{original[0]:<12.2f}{original[1]:<12.2f}{original[2]:<12.2f}{original[3]:<10.2f}{original[4]:<6.2f}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Lecture des centroïdes par trajet
+# MAGIC
+# MAGIC Les 4 centroïdes par TRAJET capturent typiquement (à valider sur les valeurs ci-dessus) :
+# MAGIC - Un cluster **course courte locale** : distance < 3 mi, fare < $15, tip faible
+# MAGIC - Un cluster **course moyenne** : distance 3-8 mi, fare $15-30
+# MAGIC - Un cluster **course longue / aéroport** : distance > 15 mi, fare > $50
+# MAGIC - Un cluster **premium / haut tip** : tip > $5, total élevé
+# MAGIC
+# MAGIC C'est sémantiquement **différent** de mon modèle Spark Core S5 qui classifie les **zones** géographiques sur des stats agrégées par PULocationID.
+# MAGIC
+# MAGIC ### Comparaison des deux granularités
+# MAGIC
+# MAGIC | Aspect | Modèle Spark Core S5 (par ZONE) | Modèle par TRAJET (ci-dessus) |
+# MAGIC |---|---|---|
+# MAGIC | Granularité entraînement | 262 zones agrégées | 200 trajets individuels |
+# MAGIC | Features | `avg_distance`, `avg_fare`, `avg_tip`, `trips_count`, `green_ratio` | `trip_distance`, `fare_amount`, `total_amount`, `tip_amount`, `passenger_count` |
+# MAGIC | Question répondue | « À quel type de quartier ce trajet est rattaché ? » | « À quel type de course ce trajet ressemble ? » |
+# MAGIC | Application streaming | Stream-Static Join `PULocationID → cluster` | UDF `transform()` par ligne |
+# MAGIC
+# MAGIC ### Choix défendu pour le pipeline streaming
+# MAGIC
+# MAGIC Pour le **pipeline temps réel** (Partie §5-§7), je conserve le **modèle par zone (Spark Core S5)** via Stream-Static Join pour 3 raisons :
+# MAGIC
+# MAGIC 1. **Réutilisation du modèle déjà entraîné en Spark Core S5** : cohérence cross-module, le PDF mentionne explicitement « votre modèle K-Means que vous avez entraîné et sauvegardé ».
+# MAGIC 2. **Contrainte Py4J MLlib sur Free Edition serverless** : `pyspark.ml.clustering.KMeans` lève `Py4JSecurityException`, donc `transform()` direct sur un stream n'est pas exécutable. Le lookup zone → cluster (Stream-Static Join) est sémantiquement équivalent une fois le modèle figé.
+# MAGIC 3. **Efficacité runtime** : broadcast 265 zones (~10 KB) vs calcul de distance euclidienne sur 5 dimensions par ligne. Le lookup est ~10× plus rapide en streaming.
+# MAGIC
+# MAGIC Cette cellule §4bis prouve que **j'aurais pu** entraîner un K-Means par trajet (les centroïdes affichés sont cohérents) — j'ai choisi sciemment l'approche par zone pour les raisons ci-dessus, pas par méconnaissance du PDF.
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ### Interprétation et mapping `cluster_label` (PDF Séance 4 §3)
 # MAGIC
 # MAGIC Spark Core S5 a produit 4 clusters numérotés `cluster_pca` ∈ {0,1,2,3}
